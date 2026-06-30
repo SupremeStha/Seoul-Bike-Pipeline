@@ -1,0 +1,160 @@
+services:
+
+  myredis:
+    image: redis:7-alpine
+    container_name: myredis
+    ports:
+      - "9000:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - airflow-net
+
+  mymcs:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcs
+    container_name: mymcs
+    hostname: mcs1
+    environment:
+      PM1:                 mcs1
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE:      bikedb
+      MYSQL_USER:          mariadbuser
+      MYSQL_PASSWORD:      "Sunway@123"
+    shm_size: '1g'
+    ports:
+      - "3307:3306"
+    restart: unless-stopped
+    volumes:
+      - mariadb_data:/var/lib/mysql
+      - mariadb_cs:/var/lib/columnstore
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - |
+          mariadb -u root -proot123 -e "SELECT 1;" &>/dev/null &&
+          ps aux | grep -q "[P]rimProc" &&
+          ps aux | grep -q "[D]MLProc"
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+    networks:
+      airflow-net:
+        aliases:
+          - mcs1
+
+  mypostgres:
+    image: postgres:15-alpine
+    container_name: mypostgres
+    environment:
+      POSTGRES_USER:     airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB:       airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - airflow-net
+
+  myairflow:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: myairflow
+    depends_on:
+      mypostgres:
+        condition: service_healthy
+      myredis:
+        condition: service_healthy
+      mymcs:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR:             LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES:        "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@mypostgres/airflow
+      AIRFLOW__WEBSERVER__SECRET_KEY:      "bikemlops2024secret"
+      AIRFLOW__CORE__FERNET_KEY:           "uRSoMXbQJFElNFl2n7q_SjMSBp2PfQtIeU_t3ghbmoo="
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./data:/opt/airflow/data
+      - ./models:/opt/airflow/models
+      - ./reports:/opt/airflow/reports
+      - ./mlruns:/opt/airflow/mlruns
+      - airflow_logs:/opt/airflow/logs
+    ports:
+      - "9090:8080"
+      - "5000:5000"
+    restart: unless-stopped
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create -u admin -p admin123 -f Admin -l User -r Admin -e admin@airflow.local 2>/dev/null || true &&
+        airflow variables set bike_csv_path /opt/airflow/data/SeoulBikeData.csv 2>/dev/null || true &&
+        mlflow ui --host 0.0.0.0 --port 5000 --backend-store-uri file:///opt/airflow/mlruns &
+        airflow webserver --port 8080 &
+        airflow scheduler
+
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - airflow-net
+
+  airflow-auto-trigger:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: airflow_auto_trigger
+    depends_on:
+      myairflow:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@mypostgres/airflow
+    command: >
+      bash -c "
+        sleep 45 &&
+        airflow dags unpause seoul_bike_pipeline &&
+        airflow dags trigger seoul_bike_pipeline
+      "
+    networks:
+      - airflow-net
+
+  myfastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile.fastapi
+    container_name: myfastapi
+    volumes:
+      - ./models:/opt/airflow/models
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    networks:
+      - airflow-net
+
+volumes:
+  mariadb_data:
+  mariadb_cs:
+  postgres_data:
+    name: airflow_postgres_persistent
+  airflow_logs:
+
+networks:
+  airflow-net:
+    driver: bridge

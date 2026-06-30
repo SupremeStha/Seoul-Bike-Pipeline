@@ -1,0 +1,108 @@
+FROM mariadb/columnstore:23.02.4
+
+RUN cat > /usr/local/bin/mcs-entrypoint.sh << 'EOF'
+#!/bin/bash
+set -e
+
+IFLAG="/etc/columnstore/container-initialized"
+PFLAG="/etc/columnstore/bikedb-provisioned"
+CMAPI_KEY="somekey123"
+LOG="/var/log/mariadb/columnstore"
+ROOT_PASS="${MYSQL_ROOT_PASSWORD:-root123}"
+
+# First-boot initialisation
+if [ ! -f "$IFLAG" ]; then
+    echo "[entrypoint] First boot — running columnstore-init..."
+    mkdir -p "$LOG"
+    if ! /usr/bin/columnstore-init &>"$LOG/columnstore-init.log"; then
+        echo "[entrypoint] ERROR: columnstore-init failed."
+        cat "$LOG/columnstore-init.log" || true
+        exit 1
+    fi
+    echo "[entrypoint] columnstore-init complete."
+fi
+
+# Start rsyslog and MariaDB
+echo "[entrypoint] Starting rsyslog..."
+rsyslogd 2>/dev/null || true
+
+echo "[entrypoint] Starting MariaDB..."
+/etc/init.d/mariadb start
+
+# Wait for MariaDB
+echo "[entrypoint] Waiting for MariaDB..."
+for i in $(seq 1 60); do
+    if mariadb -u root -p"$ROOT_PASS" -e "SELECT 1;" &>/dev/null; then
+        echo "[entrypoint] MariaDB is ready."
+        break
+    fi
+    if [ "$i" -eq 60 ]; then
+        echo "[entrypoint] ERROR: MariaDB did not become ready."
+        exit 1
+    fi
+    sleep 2
+done
+
+# Start CMAPI
+echo "[entrypoint] Starting CMAPI..."
+touch "$LOG/cmapi_server.log" && chmod 666 "$LOG/cmapi_server.log"
+cd /usr/share/columnstore/cmapi || exit 1
+PYTHONPATH=/usr/share/columnstore/cmapi/deps \
+    /usr/share/columnstore/cmapi/python/bin/python3 -m cmapi_server \
+    &>"$LOG/cmapi_server.log" &
+sleep 5
+
+# Provision or restart ColumnStore cluster
+if [ ! -f "$PFLAG" ]; then
+    echo "[entrypoint] Provisioning ColumnStore cluster..."
+    curl -sk -X PUT https://127.0.0.1:8640/cmapi/0.4.0/cluster/node \
+        --header "Content-Type:application/json" \
+        --header "x-api-key:${CMAPI_KEY}" \
+        --data '{"timeout":60,"node":"127.0.0.1"}' &>/dev/null
+    sleep 5
+    curl -sk -X PUT https://127.0.0.1:8640/cmapi/0.4.0/cluster/start \
+        --header "Content-Type:application/json" \
+        --header "x-api-key:${CMAPI_KEY}" \
+        --data '{"timeout":60}' &>/dev/null
+    echo "[entrypoint] Waiting 30s for daemons..."
+    sleep 30
+    curl -sk -X PUT https://127.0.0.1:8640/cmapi/0.4.0/cluster/mode-set \
+        --header "Content-Type:application/json" \
+        --header "x-api-key:${CMAPI_KEY}" \
+        --data '{"timeout":60,"mode":"readwrite"}' &>/dev/null
+    sleep 3
+    echo "[entrypoint] Creating bikedb..."
+    mariadb -u root -p"$ROOT_PASS" -e "
+        CREATE DATABASE IF NOT EXISTS bikedb;
+        GRANT ALL PRIVILEGES ON bikedb.* TO 'mariadbuser'@'%' IDENTIFIED BY 'Sunway@123';
+        FLUSH PRIVILEGES;
+    "
+    touch "$PFLAG"
+    echo "[entrypoint] Provisioning complete."
+else
+    echo "[entrypoint] Restarting ColumnStore cluster..."
+    curl -sk -X PUT https://127.0.0.1:8640/cmapi/0.4.0/cluster/node \
+        --header "Content-Type:application/json" \
+        --header "x-api-key:${CMAPI_KEY}" \
+        --data '{"timeout":60,"node":"127.0.0.1"}' &>/dev/null
+    sleep 5
+    curl -sk -X PUT https://127.0.0.1:8640/cmapi/0.4.0/cluster/start \
+        --header "Content-Type:application/json" \
+        --header "x-api-key:${CMAPI_KEY}" \
+        --data '{"timeout":60}' &>/dev/null
+    sleep 30
+    curl -sk -X PUT https://127.0.0.1:8640/cmapi/0.4.0/cluster/mode-set \
+        --header "Content-Type:application/json" \
+        --header "x-api-key:${CMAPI_KEY}" \
+        --data '{"timeout":60,"mode":"readwrite"}' &>/dev/null
+    sleep 3
+    echo "[entrypoint] Cluster restarted."
+fi
+
+echo "[entrypoint] All done. Tailing logs..."
+exec tail -vf -n +1 "$LOG"/*.log
+EOF
+
+RUN chmod +x /usr/local/bin/mcs-entrypoint.sh
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/mcs-entrypoint.sh"]

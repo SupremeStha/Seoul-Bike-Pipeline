@@ -1,0 +1,5 @@
+# Mark generated report files so GitHub's language stats don't count them.
+# Without this, the two Evidently AI HTML reports dominate the repo's
+# language bar and hide that this is actually a Python/Airflow project.
+reports/*.html linguist-generated=true
+*.ipynb linguist-vendored=false
